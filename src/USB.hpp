@@ -59,7 +59,7 @@ public:
             throw std::runtime_error(std::string("ioctl GET_DESCRIPTOR failed: ") + std::strerror(errno));
         }
 
-        int offset = 0;
+        uint32_t offset = 0;
         while (offset + 2 < sizeof(buffer)) {
             uint8_t len = buffer[offset];
             uint8_t type = buffer[offset + 1];
@@ -74,7 +74,7 @@ public:
                     m_endpoints.push_back({
                         .address = address,
                         .attributes = buffer[offset + 3],
-                        .max_packet_size = buffer[offset + 4] | (buffer[offset + 5] << 8)
+                        .max_packet_size = uint16_t(buffer[offset + 4] | (buffer[offset + 5] << 8))
                     });
                 }
             }
@@ -97,7 +97,7 @@ public:
 
     void start(callback_t callback) {
         static uint8_t data[64];
-        
+
         while (true) {
             for (const auto& ep : m_endpoints) {
 #if LINUX

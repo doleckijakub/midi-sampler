@@ -1,0 +1,1 @@
+g++ -o sampler -Wall -Wextra -Isrc src/*.cpp
