@@ -1,1 +1,1 @@
-g++ -o sampler -Wall -Wextra -Isrc src/*.cpp
+g++ -o sampler -Wall -Wextra -Isrc src/*.cpp -lglfw -lGLEW -lGL
