@@ -12,12 +12,12 @@
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #include <sndfile.h>
-#include <alsa/asoundlib.h>
 
 constexpr int NUM_KEYS = 121;
 int wavSampleRate = 44100;
 int wavChannels = 1;
 static uint8_t keys[NUM_KEYS] = {0};
+static uint8_t pitch = 64;
 static std::vector<float> sampleData;
 static std::atomic<bool> sampleLoaded = false;
 std::mutex sampleMutex;
@@ -27,29 +27,10 @@ void setKeyVelocity(uint8_t key, uint8_t velocity) {
     keys[key] = velocity;
 }
 
-void fillRect(float x1, float y1, float x2, float y2, float r, float g, float b) {
-    glColor3f(r, g, b);
-    glBegin(GL_QUADS);
-    glVertex2f(x1, y1);
-    glVertex2f(x2, y1);
-    glVertex2f(x2, y2);
-    glVertex2f(x1, y2);
-    glEnd();
-}
-
-void drawRect(float x1, float y1, float x2, float y2, float r, float g, float b) {
-    glColor3f(r, g, b);
-    glBegin(GL_LINES);
-    glVertex2f(x1, y1); glVertex2f(x2, y1);
-    glVertex2f(x2, y1); glVertex2f(x2, y2);
-    glVertex2f(x2, y2); glVertex2f(x1, y2);
-    glVertex2f(x1, y2); glVertex2f(x1, y1);
-    glVertex2f(x1, y1); glVertex2f(x2, y1);
-    glEnd();
-}
-
-float frequencyFromMidi(int key) {
-    return 440.0f * std::pow(2.0f, (key - 69) / 12.0f);
+float pitchBendFactor() {
+    int bend = static_cast<int>(pitch) - 64;
+    float semitoneRange = 5.0f;
+    return std::pow(2.0f, bend * semitoneRange / 12.0f / 63.0f);
 }
 
 struct Voice {
@@ -81,7 +62,6 @@ static int paCallback(const void*, void* outputBuffer, unsigned long framesPerBu
     for (unsigned long i = 0; i < framesPerBuffer; ++i) {
         float left = 0.0f;
         float right = 0.0f;
-
         for (auto& v : activeVoices) {
             if (!v.alive) continue;
             if (v.pos + 1.0f < static_cast<float>(sampleData.size())) {
@@ -90,14 +70,14 @@ static int paCallback(const void*, void* outputBuffer, unsigned long framesPerBu
                 float smp = sampleData[ipos] + (sampleData[ipos + 1] - sampleData[ipos]) * frac;
                 left += smp * v.velocity;
                 right += smp * v.velocity;
-                v.pos += v.increment;
+                v.pos += v.increment * pitchBendFactor();
             } else {
                 v.alive = false;
             }
         }
 
         activeVoices.erase(std::remove_if(activeVoices.begin(), activeVoices.end(),
-                                          [](const Voice& vv) { return !vv.alive; }),
+                                          [](const Voice& vv){ return !vv.alive; }),
                            activeVoices.end());
 
         *out++ = left * 0.2f;
@@ -133,25 +113,68 @@ void loadWavFile(const char* path) {
 }
 
 void dropCallback(GLFWwindow*, int count, const char** paths) {
-    if (count > 0) loadWavFile(paths[0]);
+    if (count > 0) {
+        loadWavFile(paths[0]);
+        
+        std::lock_guard<std::mutex> lock(voiceMutex);
+        activeVoices.clear();
+    }
+}
+
+float frequencyFromMidi(int key) {
+    return 440.0f * std::pow(2.0f, (key - 69) / 12.0f);
+}
+
+void drawKey(float x, float y, float w, float h, float r, float g, float b, bool border = true) {
+    glColor3f(r, g, b);
+    glBegin(GL_QUADS);
+    glVertex2f(x, y);
+    glVertex2f(x + w, y);
+    glVertex2f(x + w, y + h);
+    glVertex2f(x, y + h);
+    glEnd();
+
+    if (border) {
+        glColor3f(0, 0, 0);
+        glBegin(GL_LINE_LOOP);
+        glVertex2f(x, y);
+        glVertex2f(x + w, y);
+        glVertex2f(x + w, y + h);
+        glVertex2f(x, y + h);
+        glEnd();
+    }
 }
 
 int main(int argc, char* argv[]) {
     if (argc != 2) return 1;
-
     USB usb(argv[1]);
+
     std::thread([&]() {
-        usb.start([&](uint8_t, uint8_t* data, uint8_t count) {
+        usb.start([&](uint8_t, uint8_t* data, uint8_t count){
             if (count < 4) return;
-            if (data[0] == 0x09) {
-                int key = data[2];
-                int vel = data[3];
-                if (vel > 0) {
-                    std::lock_guard<std::mutex> lock(voiceMutex);
-                    Voice v{key, 0.0f, static_cast<float>(wavSampleRate) / outputSampleRate * (frequencyFromMidi(key) / frequencyFromMidi(baseMidiKey)), vel / 127.0f, true};
-                    activeVoices.push_back(v);
+
+            switch (data[0]) {
+                case 0x08: break; // Note off
+                case 0x09: { // Note on
+                    int key = data[2];
+                    int vel = data[3];
+                    
+                    if (vel > 0) {
+                        std::lock_guard<std::mutex> lock(voiceMutex);
+                        Voice v{key, 0.0f, static_cast<float>(wavSampleRate) / outputSampleRate *
+                                        (frequencyFromMidi(key)/frequencyFromMidi(baseMidiKey)),
+                                vel / 127.0f, true};
+                        activeVoices.push_back(v);
+                    }
+                    
+                    setKeyVelocity(static_cast<uint8_t>(key), static_cast<uint8_t>(vel));
+                } break;
+                case 0x0E: { // Pitch controll
+                    pitch = data[3];
+                } break;
+                default: {
+                    std::printf("%02x %02x %02x %02x\n", data[0], data[1], data[2], data[3]);
                 }
-                setKeyVelocity(static_cast<uint8_t>(key), static_cast<uint8_t>(vel));
             }
         });
     }).detach();
@@ -197,38 +220,39 @@ int main(int argc, char* argv[]) {
     Pa_StartStream(stream);
 
     if (!glfwInit()) return 1;
-    glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-    GLFWwindow* window = glfwCreateWindow(1800, 300, "M-Audio Oxygen Pro Mini Sampler", nullptr, nullptr);
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+    GLFWwindow* window = glfwCreateWindow(1800, 400, "M-Audio Oxygen Pro Mini Sampler", nullptr, nullptr);
     if (!window) return 1;
     glfwMakeContextCurrent(window);
     glfwSetDropCallback(window, dropCallback);
     if (glewInit() != GLEW_OK) return 1;
-    glViewport(0, 0, 1800, 300);
 
     while (!glfwWindowShouldClose(window)) {
-        glfwPollEvents();
-        glClearColor(0,1,1,1);
+        int width, height;
+        glfwGetFramebufferSize(window, &width, &height);
+        glViewport(0, 0, width, height);
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(0, width, 0, height, -1, 1);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+        glClearColor(0, 0.1f, 0.1f, 1);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        float whiteKeyWidth = 1.0f/52.0f;
-        float whiteKeyHeight = 0.8f;
+        float pianoHeight = height / 3.0f;
+        float whiteKeyWidth = width / 52.0f;
+        float whiteKeyHeight = pianoHeight;
         float blackKeyWidth = whiteKeyWidth * 0.6f;
-        float blackKeyHeight = whiteKeyHeight * 0.6f;
-        float xScale = 2.0f;
-        float xOffset = -1.0f;
-        float yScale = -2.0f;
-        float yOffset = 1.0f;
+        float blackKeyHeight = pianoHeight * 0.6f;
 
         int whiteIndex = 0;
         for (int i = 0; i < NUM_KEYS; ++i) {
             int mod12 = i % 12;
             bool isWhite = mod12==0||mod12==2||mod12==4||mod12==5||mod12==7||mod12==9||mod12==11;
             if (isWhite) {
-                float x0 = whiteIndex * whiteKeyWidth;
-                float x1 = x0 + whiteKeyWidth;
-                float t = keys[i] / 127.0f;
-                fillRect(x0*xScale + xOffset, whiteKeyHeight*yScale + yOffset, x1*xScale + xOffset, 0*yScale + yOffset, 1,1-t,1-t);
-                drawRect(x0*xScale + xOffset, whiteKeyHeight*yScale + yOffset, x1*xScale + xOffset, 0*yScale + yOffset, 0,0,0);
+                float x = whiteIndex * whiteKeyWidth;
+                float t = keys[i]/127.f;
+                drawKey(x, 0, whiteKeyWidth, whiteKeyHeight, 1,1-t,1-t);
                 whiteIndex++;
             }
         }
@@ -239,16 +263,15 @@ int main(int argc, char* argv[]) {
             bool isWhite = mod12==0||mod12==2||mod12==4||mod12==5||mod12==7||mod12==9||mod12==11;
             bool isBlack = mod12==1||mod12==3||mod12==6||mod12==8||mod12==10;
             if (isBlack) {
-                float x0 = whiteIndex * whiteKeyWidth - blackKeyWidth*0.5f;
-                float x1 = x0 + blackKeyWidth;
-                float t = keys[i] / 127.0f;
-                fillRect(x0*xScale + xOffset, blackKeyHeight*yScale + yOffset, x1*xScale + xOffset, 0*yScale + yOffset, t,0,0);
-                drawRect(x0*xScale + xOffset, blackKeyHeight*yScale + yOffset, x1*xScale + xOffset, 0*yScale + yOffset, 0,0,0);
+                float x = whiteIndex * whiteKeyWidth - blackKeyWidth*0.5f;
+                float t = keys[i]/127.f;
+                drawKey(x, whiteKeyHeight - blackKeyHeight, blackKeyWidth, blackKeyHeight, t,0,0);
             }
             if (isWhite) whiteIndex++;
         }
 
         glfwSwapBuffers(window);
+        glfwPollEvents();
     }
 
     Pa_StopStream(stream);
