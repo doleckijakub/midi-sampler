@@ -5,6 +5,7 @@
 namespace cfg {
 
 constexpr int NUM_KEYS = 121;
+constexpr int NUM_PERC = 8;
 constexpr int DEFAULT_WAV_SAMPLE_RATE = 44100;
 constexpr int DEFAULT_WAV_CHANNELS = 1;
 constexpr float OUTPUT_SAMPLE_RATE = 44100.f;

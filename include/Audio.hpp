@@ -3,6 +3,7 @@
 #include "Config.hpp"
 
 #include <vector>
+#include <array>
 #include <mutex>
 #include <atomic>
 #include <cstdint>
@@ -21,16 +22,20 @@ public:
     Audio& operator=(const Audio&) = delete;
 
     void noteOn(uint8_t key, uint8_t velocity);
+    void percOn(uint8_t idx, uint8_t velocity);
     void pitchBend(uint8_t value);
 
     bool loadSample(const char* path);
+    bool loadPercSample(uint8_t idx, const char* path);
 
     void computeSpectrum();
     std::vector<float> getSpectrumCopy() const;
 
-    std::vector<uint8_t> getKeyVelocitiesCopy() const;
+    std::array<uint8_t, cfg::NUM_KEYS> getKeyVelocitiesCopy() const;
+    std::array<uint8_t, cfg::NUM_PERC> getPercVelocitiesCopy() const;
 
-    void decayKeysOnce(uint32_t ms = 10);
+    void decayKeysOnce();
+    void decayPercOnce();
 
 private:
     struct Voice {
@@ -41,6 +46,22 @@ private:
         bool alive;
     };
 
+    struct PercVoice {
+        int idx;
+        float pos;
+        float increment;
+        float velocity;
+        bool alive;
+    };
+
+    struct Sample {
+        std::vector<float> data;
+        mutable std::mutex mutex;
+        std::atomic<bool> loaded = false;
+        int rate = cfg::DEFAULT_WAV_SAMPLE_RATE;
+        int channels = cfg::DEFAULT_WAV_CHANNELS;
+    };
+
     static int paCallback(const void* input, void* output,
                           unsigned long framesPerBuffer,
                           const PaStreamCallbackTimeInfo* timeInfo,
@@ -48,12 +69,13 @@ private:
                           void* userData);
     int processAudio(void* outputBuffer, unsigned long framesPerBuffer);
 
-    std::vector<float> sampleData_;
-    mutable std::mutex sampleMutex_;
-    std::atomic<bool> sampleLoaded_;
-
+    Sample pianoSample_;
     std::vector<Voice> activeVoices_;
     mutable std::mutex voiceMutex_;
+
+    std::array<Sample, cfg::NUM_PERC> percSamples_;
+    std::vector<PercVoice> activePercs_;
+    mutable std::mutex percMutex_;
 
     std::vector<float> audioSnapshot_;
     mutable std::mutex audioSnapshotMutex_;
@@ -61,7 +83,8 @@ private:
     std::vector<float> fftSmoothed_;
     std::vector<float> hannWindow_;
 
-    std::vector<uint8_t> keys_;
+    std::array<uint8_t, cfg::NUM_KEYS> keys_;
+    std::array<uint8_t, cfg::NUM_PERC> perc_;
     std::atomic<uint8_t> pitch_;
 
     PaStream* stream_;
@@ -69,7 +92,4 @@ private:
     void initHannWindow();
     float pitchBendFactor() const;
     float frequencyFromMidi(int key) const;
-
-    int wavSampleRate_;
-    int wavChannels_;
 };

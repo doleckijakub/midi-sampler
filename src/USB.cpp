@@ -19,6 +19,13 @@ USB::USB(const char *dev_path) {
         throw std::runtime_error(std::string("open failed: ") + std::strerror(errno));
     }
 
+    int interface_number = 1; // typically interface 0 or 1; check lsusb -v
+
+if (::ioctl(m_fd, USBDEVFS_CLAIMINTERFACE, &interface_number) < 0) {
+    ::close(m_fd);
+    throw std::runtime_error(std::string("Failed to claim interface: ") + std::strerror(errno));
+}
+
     uint8_t buffer[256];
     usbdevfs_ctrltransfer ctrl{};
     ctrl.bRequestType = USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_DEVICE;

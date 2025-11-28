@@ -7,16 +7,12 @@
 #include <cstring>
 
 Audio::Audio()
-    : sampleData_(),
-      sampleLoaded_(false),
-      activeVoices_(),
+    : activeVoices_(),
       fftSmoothed_(cfg::FFT_SIZE / 2, 0.f),
       hannWindow_(cfg::FFT_SIZE, 0.f),
-      keys_(cfg::NUM_KEYS, 0),
+      keys_({ 0 }),
       pitch_(64),
-      stream_(nullptr),
-      wavSampleRate_(cfg::DEFAULT_WAV_SAMPLE_RATE),
-      wavChannels_(cfg::DEFAULT_WAV_CHANNELS)
+      stream_(nullptr)
 {
     PaError err = Pa_Initialize();
     if (err != paNoError) {
@@ -25,7 +21,7 @@ Audio::Audio()
 
     initHannWindow();
 
-    PaDeviceIndex device;
+    PaDeviceIndex device = paNoDevice;
 
     {
         int numDevices = Pa_GetDeviceCount();
@@ -100,8 +96,9 @@ void Audio::noteOn(uint8_t key, uint8_t velocity) {
     if (key >= cfg::NUM_KEYS) return;
     
     std::lock_guard<std::mutex> lockVoice(voiceMutex_);
-    float inc = static_cast<float>(wavSampleRate_) / cfg::OUTPUT_SAMPLE_RATE *
+    float inc = static_cast<float>(pianoSample_.rate) / cfg::OUTPUT_SAMPLE_RATE *
                 (frequencyFromMidi(key) / frequencyFromMidi(60));
+    
     Voice v;
     v.key = static_cast<int>(key);
     v.pos = 0.f;
@@ -111,10 +108,34 @@ void Audio::noteOn(uint8_t key, uint8_t velocity) {
     activeVoices_.push_back(v);
 
     {
-        std::lock_guard<std::mutex> lockKeys(sampleMutex_);
+        std::lock_guard<std::mutex> lockKeys(pianoSample_.mutex);
     }
+
     keys_[key] = velocity;
 }
+
+void Audio::percOn(uint8_t idx, uint8_t velocity) {
+    if (idx >= cfg::NUM_PERC) return;
+
+    std::lock_guard<std::mutex> lockVoice(voiceMutex_);
+    float inc = static_cast<float>(percSamples_[idx].rate) / cfg::OUTPUT_SAMPLE_RATE;
+    
+    PercVoice pv;
+    pv.idx = idx;
+    pv.pos = 0.f;
+    pv.increment = inc;
+    pv.velocity = (velocity / 127.f);
+    pv.alive = true;
+
+    activePercs_.push_back(pv);
+
+    {
+        std::lock_guard<std::mutex> lockKeys(percSamples_[idx].mutex);
+    }
+    
+    perc_[idx] = velocity;
+}
+
 
 void Audio::pitchBend(uint8_t value) {
     pitch_.store(value);
@@ -128,32 +149,75 @@ bool Audio::loadSample(const char* path) {
         return false;
     }
 
-    wavSampleRate_ = sfinfo.samplerate;
-    wavChannels_ = sfinfo.channels;
+    pianoSample_.rate = sfinfo.samplerate;
+    pianoSample_.channels = sfinfo.channels;
     size_t samples = static_cast<size_t>(sfinfo.frames) * sfinfo.channels;
     std::vector<float> data(samples);
     sf_read_float(sndfile, data.data(), static_cast<sf_count_t>(samples));
     sf_close(sndfile);
 
-    if (wavChannels_ == 2) {
+    if (pianoSample_.channels == 2) {
         std::vector<float> mono(sfinfo.frames);
         for (size_t i = 0; i < static_cast<size_t>(sfinfo.frames); ++i) {
             mono[i] = 0.5f * (data[i * 2] + data[i * 2 + 1]);
         }
         data = std::move(mono);
-        wavChannels_ = 1;
+        pianoSample_.channels = 1;
     }
 
     {
-        std::lock_guard<std::mutex> lock(sampleMutex_);
-        sampleData_ = std::move(data);
-        sampleLoaded_.store(true);
+        std::lock_guard<std::mutex> lock(pianoSample_.mutex);
+        pianoSample_.data = std::move(data);
+        pianoSample_.loaded.store(true);
     }
     
     {
         std::lock_guard<std::mutex> lock(voiceMutex_);
         activeVoices_.clear();
     }
+
+    std::printf("Loaded sample %s in piano\n", path);
+
+    return true;
+}
+
+bool Audio::loadPercSample(uint8_t idx, const char* path) {
+    SF_INFO sfinfo{};
+    SNDFILE* sndfile = sf_open(path, SFM_READ, &sfinfo);
+    if (!sndfile) {
+        std::cerr << "Failed to open sample: " << path << "\n";
+        return false;
+    }
+
+    percSamples_[idx].rate = sfinfo.samplerate;
+    percSamples_[idx].channels = sfinfo.channels;
+    size_t samples = static_cast<size_t>(sfinfo.frames) * sfinfo.channels;
+    std::vector<float> data(samples);
+    sf_read_float(sndfile, data.data(), static_cast<sf_count_t>(samples));
+    sf_close(sndfile);
+
+    if (percSamples_[idx].channels == 2) {
+        std::vector<float> mono(sfinfo.frames);
+        for (size_t i = 0; i < static_cast<size_t>(sfinfo.frames); ++i) {
+            mono[i] = 0.5f * (data[i * 2] + data[i * 2 + 1]);
+        }
+        data = std::move(mono);
+        percSamples_[idx].channels = 1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(percSamples_[idx].mutex);
+        percSamples_[idx].data = std::move(data);
+        percSamples_[idx].loaded.store(true);
+    }
+    
+    {
+        std::lock_guard<std::mutex> lock(voiceMutex_);
+        activeVoices_.clear();
+    }
+
+    std::printf("Loaded sample %s in percussion key %d\n", path, idx);
+
     return true;
 }
 
@@ -173,43 +237,58 @@ int Audio::paCallback(const void* input, void* output,
 
 int Audio::processAudio(void* outputBuffer, unsigned long framesPerBuffer) {
     float* out = reinterpret_cast<float*>(outputBuffer);
-    std::vector<float> localSample;
+
+    // Copy piano sample once
+    std::vector<float> localPiano;
     {
-        std::lock_guard<std::mutex> lock(sampleMutex_);
-        if (sampleLoaded_ && !sampleData_.empty()) {
-            localSample = sampleData_;
-        }
+        std::lock_guard<std::mutex> lock(pianoSample_.mutex);
+        if (pianoSample_.loaded) localPiano = pianoSample_.data;
     }
 
-    if (!sampleLoaded_ || localSample.empty()) {
-        for (unsigned long i = 0; i < framesPerBuffer; ++i) {
-            *out++ = 0.f;
-            *out++ = 0.f;
-        }
-        return paContinue;
+    // Copy percussion samples once
+    std::vector<std::vector<float>> localPerc(cfg::NUM_PERC);
+    for (size_t i = 0; i < cfg::NUM_PERC; ++i) {
+        std::lock_guard<std::mutex> lock(percSamples_[i].mutex);
+        if (percSamples_[i].loaded) localPerc[i] = percSamples_[i].data;
     }
 
-    std::scoped_lock lock(voiceMutex_);
+    std::scoped_lock lock(voiceMutex_, percMutex_);
 
     for (unsigned long i = 0; i < framesPerBuffer; ++i) {
         float left = 0.f, right = 0.f;
+
         for (auto &v : activeVoices_) {
-            if (!v.alive) continue;
-            if (v.pos + 1.f < static_cast<float>(localSample.size())) {
+            if (!v.alive || localPiano.empty()) continue;
+
+            if (v.pos + 1.f < static_cast<float>(localPiano.size())) {
                 size_t ipos = static_cast<size_t>(v.pos);
                 float frac = v.pos - ipos;
-                float smp = localSample[ipos] + (localSample[ipos + 1] - localSample[ipos]) * frac;
+                float smp = localPiano[ipos] + (localPiano[ipos + 1] - localPiano[ipos]) * frac;
                 left += smp * v.velocity;
                 right += smp * v.velocity;
                 v.pos += v.increment * pitchBendFactor();
-            } else {
-                v.alive = false;
-            }
+            } else v.alive = false;
+        }
+
+        for (auto &p : activePercs_) {
+            if (!p.alive || localPerc[p.idx].empty()) continue;
+
+            if (p.pos + 1.f < static_cast<float>(localPerc[p.idx].size())) {
+                size_t ipos = static_cast<size_t>(p.pos);
+                float frac = p.pos - ipos;
+                float smp = localPerc[p.idx][ipos] + (localPerc[p.idx][ipos + 1] - localPerc[p.idx][ipos]) * frac;
+                left += smp * p.velocity;
+                right += smp * p.velocity;
+                p.pos += p.increment * pitchBendFactor();
+            } else p.alive = false;
         }
 
         activeVoices_.erase(std::remove_if(activeVoices_.begin(), activeVoices_.end(),
                                            [](const Voice& vv){ return !vv.alive; }),
                             activeVoices_.end());
+        activePercs_.erase(std::remove_if(activePercs_.begin(), activePercs_.end(),
+                                          [](const PercVoice& pp){ return !pp.alive; }),
+                           activePercs_.end());
 
         *out++ = left * 0.2f;
         *out++ = right * 0.2f;
@@ -252,19 +331,25 @@ void Audio::computeSpectrum() {
 }
 
 std::vector<float> Audio::getSpectrumCopy() const {
-    std::lock_guard<std::mutex> lock(sampleMutex_);
     return fftSmoothed_;
 }
 
-std::vector<uint8_t> Audio::getKeyVelocitiesCopy() const {
-    std::lock_guard<std::mutex> lock(sampleMutex_);
+std::array<uint8_t, cfg::NUM_KEYS> Audio::getKeyVelocitiesCopy() const {
     return keys_;
 }
 
-void Audio::decayKeysOnce(uint32_t ms) {
-    (void) ms;
-    
+std::array<uint8_t, cfg::NUM_PERC> Audio::getPercVelocitiesCopy() const {
+    return perc_;
+}
+
+void Audio::decayKeysOnce() {
     for (size_t i = 0; i < keys_.size(); ++i) {
         if (keys_[i]) --keys_[i];
+    }
+}
+
+void Audio::decayPercOnce() {
+    for (size_t i = 0; i < perc_.size(); ++i) {
+        if (perc_[i]) --perc_[i];
     }
 }
